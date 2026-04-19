@@ -1,12 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Increase max duration for API routes that call n8n (long-running workflows)
-  experimental: {
-    serverActions: {
-      bodySizeLimit: "2mb",
-    },
-  },
+  // Server actions are stable in Next.js 16 — no experimental config needed
 };
 
 export default nextConfig;
