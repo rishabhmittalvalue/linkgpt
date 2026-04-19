@@ -1,0 +1,138 @@
+{
+  "name": "LinkGPT – AI LinkedIn Outreach",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "linkgpt-search",
+        "responseMode": "immediatelyOnReceive",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0001-0001-0001-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "linkgpt-search"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://serpapi.com/search.json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "engine",
+              "value": "google"
+            },
+            {
+              "name": "q",
+              "value": "={{ `site:linkedin.com/in ${$json.chatInput}` }}"
+            },
+            {
+              "name": "num",
+              "value": "10"
+            },
+            {
+              "name": "hl",
+              "value": "en"
+            },
+            {
+              "name": "api_key",
+              "value": "={{ $vars.SERPAPI_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0002-0002-0002-000000000002",
+      "name": "Search LinkedIn (SerpAPI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ─────────────────────────────────────────────────────────\n// Node: Parse Profiles & Generate Emails\n// Reads SerpAPI results, calls Gemini once per profile,\n// then returns a single aggregated payload for the callback.\n// ─────────────────────────────────────────────────────────\n\nconst GEMINI_API_KEY = $vars.GEMINI_API_KEY;\nconst GEMINI_MODEL   = 'gemini-1.5-flash';\nconst MAX_PROFILES   = 10;\n\n// ── Pull webhook data (body fields are spread directly into $json for webhook v2)\nconst webhookItem = $('Webhook').first().json;\nconst chatInput   = webhookItem.chatInput   ?? webhookItem.body?.chatInput;\nconst searchId    = webhookItem.searchId    ?? webhookItem.body?.searchId;\nconst callbackUrl = webhookItem.callbackUrl ?? webhookItem.body?.callbackUrl;\n\nif (!searchId || !callbackUrl) {\n  throw new Error('Missing searchId or callbackUrl in webhook payload');\n}\n\n// ── Pull SerpAPI organic results\nconst serpData      = $input.first().json;\nconst organicResults = serpData.organic_results ?? [];\n\nif (organicResults.length === 0) {\n  return [{ json: { searchId, callbackUrl, results: [] } }];\n}\n\n// ── Helper: extract name + company from a LinkedIn SERP title\n// Typical title formats:\n//   \"John Doe - CTO at Acme Corp | LinkedIn\"\n//   \"Jane Smith | VP of Engineering at Stripe\"\nfunction parseTitleDetails(title) {\n  const clean = title.replace(/ \\| LinkedIn$/, '').replace(/ - LinkedIn$/, '').trim();\n\n  // Try \"Name - Role at Company\"\n  const dashMatch = clean.match(/^(.+?) - .* at (.+)$/);\n  if (dashMatch) {\n    return { fullName: dashMatch[1].trim(), company: dashMatch[2].trim() };\n  }\n\n  // Try \"Name | Role at Company\"\n  const pipeMatch = clean.match(/^(.+?) \\| .* at (.+)$/);\n  if (pipeMatch) {\n    return { fullName: pipeMatch[1].trim(), company: pipeMatch[2].trim() };\n  }\n\n  // Fallback: everything before \" - \" or \" | \" is the name\n  const namePart = clean.split(/ - | \\| /)[0].trim();\n  return { fullName: namePart, company: '' };\n}\n\n// ── Process each profile\nconst results = [];\n\nfor (const result of organicResults.slice(0, MAX_PROFILES)) {\n  const title       = result.title   ?? '';\n  const linkedinUrl = result.link    ?? '';\n  const context     = result.snippet ?? '';\n\n  const { fullName, company } = parseTitleDetails(title);\n  const nameParts = fullName.split(' ');\n  const firstName = nameParts[0] ?? '';\n  const lastName  = nameParts.slice(1).join(' ');\n\n  // ── Call Gemini to write the cold email\n  let emailSubject = '';\n  let emailBody    = '';\n\n  try {\n    const prompt = [\n      'You are a world-class cold email copywriter. Write a short, highly personalized cold outreach email.',\n      '',\n      `Search Context (what the sender is looking for): ${chatInput}`,\n      `Prospect Name: ${firstName} ${lastName}`,\n      `Prospect Company / Role: ${company}`,\n      `LinkedIn Snippet: ${context}`,\n      `LinkedIn URL: ${linkedinUrl}`,\n      '',\n      'Return ONLY valid JSON — no markdown, no code fences, no explanation:',\n      '{',\n      '  \"email_subject\": \"...\",',\n      '  \"email_body\": \"...\"',\n      '}',\n      '',\n      'Constraints:',\n      '- Subject: ≤ 60 characters, specific and intriguing, no \"Quick question\" clichés',\n      '- Body: 80–130 words, opens with a hyper-specific observation about the prospect',\n      '- No openers like \"Hope this finds you well\" or \"I came across your profile\"',\n      '- End with one soft, clear call to action (e.g., \"Open to a 15-min chat next week?\")',\n      '- First-person, conversational, zero jargon',\n    ].join('\\n');\n\n    const res = await fetch(\n      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,\n      {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          contents: [{ parts: [{ text: prompt }] }],\n          generationConfig: { temperature: 0.75, maxOutputTokens: 512 },\n        }),\n      }\n    );\n\n    const data    = await res.json();\n    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';\n    const cleaned = rawText.replace(/```json\\n?/g, '').replace(/```\\n?/g, '').trim();\n    const parsed  = JSON.parse(cleaned);\n\n    emailSubject = parsed.email_subject ?? '';\n    emailBody    = parsed.email_body    ?? '';\n\n  } catch (err) {\n    // Graceful fallback so one failure doesn't break the whole batch\n    emailSubject = `${firstName}, quick thought`;\n    emailBody    = [\n      `Hi ${firstName},`,\n      '',\n      `I was looking for ${chatInput} and your background${company ? ` at ${company}` : ''} stood out immediately.`,\n      '',\n      'Would you be open to a quick 15-minute call? I think there could be a genuinely interesting fit.',\n      '',\n      'Best,',\n    ].join('\\n');\n  }\n\n  results.push({\n    linkedin_url:  linkedinUrl,\n    first_name:    firstName,\n    last_name:     lastName,\n    domain_name:   company,\n    context,\n    email:         '',\n    email_subject: emailSubject,\n    email_body:    emailBody,\n  });\n}\n\nreturn [{ json: { searchId, callbackUrl, results } }];\n"
+      },
+      "id": "1a2b3c4d-0003-0003-0003-000000000003",
+      "name": "Parse Profiles & Generate Emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.callbackUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ searchId: $json.searchId, results: $json.results }) }}",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0004-0004-0004-000000000004",
+      "name": "Send Results to App",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Search LinkedIn (SerpAPI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search LinkedIn (SerpAPI)": {
+      "main": [
+        [
+          {
+            "node": "Parse Profiles & Generate Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Profiles & Generate Emails": {
+      "main": [
+        [
+          {
+            "node": "Send Results to App",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {}
+}
