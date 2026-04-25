@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServer } from "@/lib/supabase";
+import { createSupabaseServerClient, supabaseServer } from "@/lib/supabase";
 
 // POST /api/search — create a search record and fire the n8n workflow
 export async function POST(req: NextRequest) {
@@ -9,12 +9,22 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Query is required" }, { status: 400 });
   }
 
+  // Get the authenticated user from session cookies
+  const authClient = await createSupabaseServerClient();
+  const {
+    data: { user },
+  } = await authClient.auth.getUser();
+
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Use service-role client to insert with explicit user_id
   const db = supabaseServer();
 
-  // Create the search record in Supabase
   const { data: search, error } = await db
     .from("searches")
-    .insert({ query: query.trim(), status: "running" })
+    .insert({ query: query.trim(), status: "running", user_id: user.id })
     .select()
     .single();
 
@@ -26,7 +36,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Fire n8n webhook — we don't await this, it runs in the background
+  // Fire n8n webhook — fire-and-forget (avoids Vercel timeout)
   const webhookUrl = process.env.N8N_WEBHOOK_URL;
   if (webhookUrl) {
     fetch(webhookUrl, {
@@ -53,12 +63,23 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "searchId is required" }, { status: 400 });
   }
 
+  // Verify user owns this search
+  const authClient = await createSupabaseServerClient();
+  const {
+    data: { user },
+  } = await authClient.auth.getUser();
+
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const db = supabaseServer();
 
   const { data: search, error: searchError } = await db
     .from("searches")
     .select("*")
     .eq("id", searchId)
+    .eq("user_id", user.id)
     .single();
 
   if (searchError || !search) {
